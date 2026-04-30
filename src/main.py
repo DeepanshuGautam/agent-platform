@@ -15,6 +15,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from src.models import Priority, TaskStatus, TaskResult
 from src.orchestrator import run_task
 from src.config import MAX_CONCURRENT_TASKS, TASK_TIMEOUT_SECONDS
+from src.cache import run_with_cache, set_cached
 from src.telemetry import (
     setup_telemetry,
     TASK_REQUESTS, TASK_DURATION, TASK_QUEUE_WAIT,
@@ -28,9 +29,6 @@ setup_telemetry(app)
 
 # Task storage
 task_store: dict[str, TaskResult] = {}
-
-# Response cache for repeated queries — avoids redundant LLM calls
-_response_cache: dict[str, dict] = {}
 
 # Limit concurrent task executions to protect downstream LLM service
 _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -68,14 +66,62 @@ async def create_task(body: CreateTaskBody):
     # Cache key: tenant + description (priority excluded because
     # task results are priority-independent in the current design)
     cache_key = f"{body.tenant_id}:{body.task_description}"
-    if cache_key in _response_cache:
+
+    # Execute the task (bounded by concurrency limit)
+    task_store[task_id] = TaskResult(
+        task_id=task_id, status=TaskStatus.PENDING,
+        tenant_id=body.tenant_id, priority=body.priority,
+    )
+
+    async def _execute_with_timeout() -> TaskResult:
+        async with _task_semaphore:
+            queue_wait = time.time() - t_submitted
+            TASK_QUEUE_WAIT.labels(tenant_id=body.tenant_id).observe(queue_wait)
+            logger.info("task_executing", extra={
+                "task_id": task_id,
+                "tenant_id": body.tenant_id,
+                "queue_wait_seconds": round(queue_wait, 3),
+            })
+            ACTIVE_TASKS.inc()
+            try:
+                return await asyncio.wait_for(
+                    run_task(
+                        task_id=task_id,
+                        description=body.task_description,
+                        tenant_id=body.tenant_id,
+                        priority=body.priority,
+                    ),
+                    timeout=TASK_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("task_timeout", extra={
+                    "task_id": task_id,
+                    "tenant_id": body.tenant_id,
+                    "timeout_seconds": TASK_TIMEOUT_SECONDS,
+                })
+                return TaskResult(
+                    task_id=task_id, status=TaskStatus.FAILED,
+                    tenant_id=body.tenant_id, priority=body.priority,
+                    error="Task execution exceeded time limit",
+                    token_usage={"prompt_tokens": 0, "completion_tokens": 0},
+                    created_at=time.time(), completed_at=time.time(),
+                )
+            finally:
+                ACTIVE_TASKS.dec()
+
+    cache_hit, raw = await run_with_cache(
+        cache_key=cache_key,
+        execute=_execute_with_timeout,
+        timeout=TASK_TIMEOUT_SECONDS,
+    )
+
+    if cache_hit:
         CACHE_HITS.labels(tenant_id=body.tenant_id).inc()
         logger.info("cache_hit", extra={"task_id": task_id, "tenant_id": body.tenant_id})
-        cached = _response_cache[cache_key]
         result = TaskResult(
             task_id=task_id, status=TaskStatus.COMPLETED,
             tenant_id=body.tenant_id, priority=body.priority,
-            result=cached.get("result"),
+            result=raw,
             token_usage={"prompt_tokens": 0, "completion_tokens": 0},
             created_at=time.time(), completed_at=time.time(),
         )
@@ -88,51 +134,7 @@ async def create_task(body: CreateTaskBody):
         ).observe(time.time() - t_submitted)
         return _to_response(result)
 
-    # Execute the task (bounded by concurrency limit)
-    task_store[task_id] = TaskResult(
-        task_id=task_id, status=TaskStatus.PENDING,
-        tenant_id=body.tenant_id, priority=body.priority,
-    )
-
-    async def _guarded_execute():
-        async with _task_semaphore:
-            queue_wait = time.time() - t_submitted
-            TASK_QUEUE_WAIT.labels(tenant_id=body.tenant_id).observe(queue_wait)
-            logger.info("task_executing", extra={
-                "task_id": task_id,
-                "tenant_id": body.tenant_id,
-                "queue_wait_seconds": round(queue_wait, 3),
-            })
-            ACTIVE_TASKS.inc()
-            try:
-                return await run_task(
-                    task_id=task_id,
-                    description=body.task_description,
-                    tenant_id=body.tenant_id,
-                    priority=body.priority,
-                )
-            finally:
-                ACTIVE_TASKS.dec()
-
-    # Enforce task-level deadline: clients should not wait indefinitely
-    try:
-        result = await asyncio.wait_for(
-            _guarded_execute(), timeout=TASK_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("task_timeout", extra={
-            "task_id": task_id,
-            "tenant_id": body.tenant_id,
-            "timeout_seconds": TASK_TIMEOUT_SECONDS,
-        })
-        result = TaskResult(
-            task_id=task_id, status=TaskStatus.FAILED,
-            tenant_id=body.tenant_id, priority=body.priority,
-            error="Task execution exceeded time limit",
-            token_usage={"prompt_tokens": 0, "completion_tokens": 0},
-            created_at=time.time(), completed_at=time.time(),
-        )
-
+    result = raw
     task_store[task_id] = result
     duration = time.time() - t_submitted
     status_label = result.status.value
@@ -160,9 +162,8 @@ async def create_task(body: CreateTaskBody):
         "token_usage": result.token_usage,
     })
 
-    # Cache successful responses for future identical requests
     if result.status == TaskStatus.COMPLETED:
-        _response_cache[cache_key] = {"result": result.result}
+        await set_cached(cache_key, result.result or "")
 
     return _to_response(result)
 
