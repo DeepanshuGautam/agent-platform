@@ -6,6 +6,11 @@ database, calculator, etc.) with realistic latency.
 
 import asyncio
 import random
+import logging
+import time
+from src.telemetry import tracer, TOOL_DURATION
+
+logger = logging.getLogger(__name__)
 
 
 async def execute_tool(tool_name: str, args: dict) -> dict:
@@ -17,13 +22,25 @@ async def execute_tool(tool_name: str, args: dict) -> dict:
         "calculator": (0.01, 0.05),
     }
     low, high = latency_map.get(tool_name, (0.05, 0.3))
-    await asyncio.sleep(random.uniform(low, high))
 
-    return {
-        "tool": tool_name,
-        "status": "success",
-        "output": f"Result from {tool_name}",
-    }
+    with tracer.start_as_current_span(f"tool:{tool_name}") as span:
+        span.set_attribute("tool.name", tool_name)
+        span.set_attribute("tool.args", str(args)[:200])
+        t0 = time.time()
+        await asyncio.sleep(random.uniform(low, high))
+        elapsed = time.time() - t0
+        TOOL_DURATION.labels(tool_name=tool_name).observe(elapsed)
+        logger.debug("tool_executed", extra={
+            "tool_name": tool_name,
+            "elapsed_seconds": round(elapsed, 3),
+        })
+        result = {
+            "tool": tool_name,
+            "status": "success",
+            "output": f"Result from {tool_name}",
+        }
+        span.set_attribute("tool.status", "success")
+        return result
 
 
 async def execute_tools(tools: list[tuple[str, dict]]) -> list[dict]:
