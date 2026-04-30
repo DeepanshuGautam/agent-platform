@@ -65,8 +65,8 @@ Each issue section below includes the exact Prometheus query or Jaeger trace ID 
 | 4 | Redundant validation LLM call — result discarded, adds latency and cost | **Medium** | Design gap |
 | 5 | Unbounded in-memory growth — task_store, cache, execution_log never evicted | **Medium** | Reliability risk |
 | 6 | Same retry policy for 429 and 500 — rate-limit errors retried aggressively | **Low** | Implementation bug |
-| 7 | Exception handler leaks stack trace and internal URL to API consumers | **High** | Security |
-| 8 | Summarise failure path is dead code — `"" is None` always False | **High** | Implementation bug |
+| 7 | Exception handler leaks stack traces and internal URLs to API consumers | **High** | Security bug |
+| 8 | Summarise failure path is dead code — `is None` never matches `""` | **Medium** | Implementation bug |
 
 ---
 
@@ -218,7 +218,7 @@ Issue 2 was **deprioritized in Task 3** for two reasons:
 
 1. **Issue 1 is the root bottleneck.** The lock bug serializes all tasks per tenant regardless of priority. Until lock-before-semaphore is fixed, even a perfect priority queue will have urgent tasks blocked behind low-priority tasks that hold the tenant lock. Fixing Issue 1 first eliminates the dominant latency contributor and makes the priority question meaningful to measure.
 
-2. **Priority queue is a larger change.** Replacing `asyncio.Lock` with `asyncio.PriorityQueue` requires rethinking the per-tenant coordination model (producers enqueue, a single consumer dequeues in priority order, or `PriorityQueue.get()` is called under the semaphore). It is the next logical improvement once Issue 1 is resolved and latency is back to normal levels.
+2. **Priority queue is a larger change.** Replacing `asyncio.Lock` with `asyncio.PriorityQueue` requires rethinking the per-tenant coordination model (producers enqueue, a consumer dequeues in priority order under the semaphore). It is the next logical improvement once Issue 1 is resolved and baseline latency is back to normal levels.
 
 ---
 
@@ -602,7 +602,7 @@ An `urgent` request with the same description as a previously-run `low` priority
 
 ---
 
-## Load Test Summary
+## Load Test Summary — Before Fixes (Baseline)
 
 ![Load test output](docs/images/beforeFix/load_test_summary.jpg)
 
@@ -635,6 +635,301 @@ Latency:
 llm_tokens_total
 ```
 
+```
+tenant-alpha: prompt=9,716   completion=30,599
+tenant-gamma: prompt=7,895   completion=24,521
+tenant-beta:  prompt=6,543   completion=20,861
+```
+
+Note: Prometheus counters are cumulative and include tokens from all runs since the container started. The per-run figures in the table above come from the load test output shown in the screenshot.
+
+---
+
+## Task 3: Fixes Applied and Before/After Comparison
+
+### Changes made
+
+#### Fix 1 — Remove tenant lock (Issue 1: head-of-line blocking)
+
+**File:** `src/main.py`
+
+**Before:**
+```python
+_tenant_locks: dict[str, asyncio.Lock] = {}
+
+async def _guarded_execute():
+    lock = _tenant_locks.setdefault(body.tenant_id, asyncio.Lock())
+    async with lock:               # ← tenant lock acquired FIRST
+        async with _task_semaphore:  # ← semaphore acquired SECOND
+            return await run_task(...)
+```
+
+**After:**
+```python
+async def _guarded_execute():
+    async with _task_semaphore:    # ← only the global semaphore
+        return await run_task(...)
+```
+
+**Why the tenant lock was removed (not just reordered):**
+
+Two fixes were considered:
+
+- **Option A (swap order):** Acquire semaphore first, then tenant lock inside. Correct if per-tenant serialization is a real requirement — e.g. if `run_task` modifies per-tenant shared state.
+- **Option B (remove lock — applied):** `run_task`, `execute_tools`, and `call_llm` are all stateless with respect to tenant. `task_store` is keyed by unique `task_id`; `_response_cache` dict writes are synchronous (no `await` between check and write at the key level). asyncio is single-threaded — no concurrent mutation of any single dict key is possible. The lock was protecting state that does not exist.
+
+**Concurrent state safety analysis:**
+
+With multiple same-tenant tasks now able to run simultaneously, the following was verified:
+
+- `task_store` — each task owns a unique UUID key; writes never collide.
+- `_execution_log` — `list.append()` is synchronous; no `await` between appends; no interleaving possible.
+- `_response_cache` — reads and writes are synchronous dict operations. However, two tasks with the same `(tenant_id, description)` can both observe a cache miss before either writes (context switch occurs at `await run_task()`), causing a **cache stampede**: both execute the full LLM pipeline and write to the same cache key. The final value is correct (both produce equivalent results), but work is duplicated. This is a known trade-off documented under the Production section.
+
+If per-tenant shared state is added in the future (e.g. a per-tenant token budget), Option A should be reinstated rather than re-introducing the original ordering bug.
+
+---
+
+#### Fix 2 — Parallel tool execution (Issue 3)
+
+**File:** `src/tool_executor.py`
+
+**Before:**
+```python
+results = []
+for tool_name, args in tools:         # ← sequential loop
+    result = await execute_tool(tool_name, args)
+    results.append(result)
+return results
+```
+
+**After:**
+```python
+return list(await asyncio.gather(
+    *[execute_tool(name, args) for name, args in tools]
+))
+```
+
+`search`, `database_lookup`, and `calculator` share no state. `asyncio.gather` runs them concurrently so wall time becomes `max(latencies)` instead of `sum(latencies)`.
+
+**Jaeger proof of parallel execution (after fix):**
+
+![Jaeger trace showing parallel tool execution](docs/images/afterFix/after_jaeger_parallel_tools.jpg)
+
+**Trace ID:** `9f7e25c` | **Total duration:** 5.24s
+
+```
+execute_tools    338.29ms   (parent span)
+  tool:search    338.04ms   ← longest tool, sets the wall time
+  tool:db        116.87ms   ← overlaps with search
+  tool:calc       25.27ms   ← overlaps with search
+
+Sequential sum would be:  338.04 + 116.87 + 25.27 = 480.18ms
+Parallel result:          338.29ms ≈ max(338.04ms)
+Time saved this trace:    141.89ms  (29.6% reduction in execute_tools)
+```
+
+The parent span (338.29ms) matches the longest child (338.04ms), proving the tools ran concurrently. Also note: **no `llm_validate` span** in this trace — Fix 3 confirmed simultaneously.
+
+---
+
+#### Fix 3 — Remove unused validate LLM call (Issue 4)
+
+**File:** `src/orchestrator.py`
+
+The entire Step 4 (`llm_validate`) block was removed. The validation result was stored in `_execution_log` but never inspected — the task always returned `COMPLETED` regardless of the quality score. Removing it saves one LLM call per task (~33% of total LLM cost) and ~0.5–4s of latency per task.
+
+---
+
+#### Fix 4 — Differentiated 429 retry backoff (Issue 6)
+
+**File:** `src/llm_client.py`
+
+**Before:**
+```python
+delay = RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** attempt)
+jitter = random.uniform(0, delay * 0.3)
+await asyncio.sleep(delay + jitter)  # same for all errors
+```
+
+**After:**
+```python
+delay = RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** attempt)
+if last_status == 429:
+    await asyncio.sleep(delay * 2 + random.uniform(0, 0.5))
+else:
+    await asyncio.sleep(delay + random.uniform(0, delay * 0.3))
+```
+
+429 now waits 2× longer than 500 to respect the rate-limit signal. A 4× multiplier was tested first and caused more timeouts (too aggressive for the 30s budget); 2× eliminates all timeouts while still reducing re-triggering of rate limits.
+
+---
+
+#### Fix 5 — Sanitize exception handler API response (Issue 7)
+
+**File:** `src/orchestrator.py`
+
+**Before:**
+```python
+error_detail = (
+    f"Task execution failed: {str(e)}\n"
+    f"Trace: {traceback.format_exc()}\n"
+    f"Pipeline stage: {'plan' if total_prompt_tokens == 0 else 'execute'}\n"
+    f"LLM endpoint: {LLM_SERVER_URL}"
+)
+```
+
+**After:**
+```python
+ctx = span.get_span_context()
+trace_ref = format(ctx.trace_id, "032x") if ctx and ctx.is_valid else "unknown"
+error_detail = f"Task execution failed. Reference trace_id={trace_ref} for details."
+```
+
+Full stack trace and LLM endpoint URL are already captured by `logger.exception("task_pipeline_error")` and accessible in Jaeger via the `trace_id`. The API response now returns only a safe, correlatable reference.
+
+---
+
+#### Fix 6 — Fix dead summarise failure path (Issue 8)
+
+**File:** `src/orchestrator.py`
+
+**Before:**
+```python
+stage_status = "error" if (summary.get("error") and summary.get("text") is None) else "ok"
+...
+if summary.get("error") and summary.get("text") is None:   # dead — text is always ""
+    return TaskResult(status=TaskStatus.FAILED, ...)
+```
+
+**After:**
+```python
+stage_status = "error" if summary.get("error") and not summary.get("text") else "ok"
+...
+if summary.get("error") and not summary.get("text"):
+    span.set_attribute("task.failed_stage", "summarise")
+    return TaskResult(status=TaskStatus.FAILED, error=summary["error"], ...)
+```
+
+`not summary.get("text")` correctly matches both `""` and `None`. Previously this branch was unreachable because the LLM client returns `text=""` on failure, not `None`.
+
+---
+
+### Before/After Load Test Comparison
+
+Same parameters: 100 requests, concurrency 15, 3 tenants, 3 priorities.
+
+| Metric | Before (baseline) | After (fixes) | Change |
+|---|---|---|---|
+| **Completed** | 95 / 100 | **100 / 100** | +5 |
+| **Failed (timeouts)** | 5 (gamma=3, alpha=2) | **0** | −5 |
+| **P50 latency** | 15.98s | **6.91s** | −57% |
+| **P95 latency** | 30.01s | **14.80s** | −51% |
+| **P99 latency** | 30.01s | **17.14s** | −43% |
+| **Max latency** | 30.01s | **17.14s** | −43% |
+
+**Token reduction from removing validate:**  
+Before: ~3 LLM calls/task. After: 2 LLM calls/task — ~33% cost reduction confirmed by token usage data.
+
+**Queue wait improvement:** Before, p95 queue wait exceeded 28s for all tenants (lock-induced head-of-line blocking). After removing the tenant lock, p95 queue wait dropped to 9.3–9.6s — reflecting only the global semaphore back-pressure at MAX_CONCURRENT_TASKS=5, not lock-induced serialization. With 15 concurrent requests competing for 5 slots, some waiting is expected and correct.
+
+**Security fix (Issue 7):** API error responses no longer leak stack traces or internal URLs. Full detail remains in structured logs with `trace_id` for operator correlation.
+
+**Dead code fix (Issue 8):** Summarise failures now correctly surface as `status=failed`; `pipeline_stage_duration_seconds{stage="summarise", status="error"}` now fires. Previously these failures silently produced `status=completed` with `result=""`.
+
+**Total fixes applied: 6** (Issues 1, 3, 4, 6, 7, 8)
+
+---
+
+## Load Test Summary — After Fixes
+
+![Load test output after fixes](docs/images/afterFix/after_load_test_summary.jpg)
+
+```
+Total requests:  100
+Completed:       100  (with result: 100, empty result: 0)
+Failed:            0
+Errors:            0
+
+Latency:
+  P50 =   6.91s   (−57% vs baseline)
+  P95 =  14.80s   (−51% vs baseline)
+  P99 =  17.14s   (−43% vs baseline)
+  Max =  17.14s   (−43% vs baseline)
+```
+
+**Token usage by tenant (this run):**
+
+| Tenant | Tasks | Prompt tokens | Completion tokens |
+|---|---|---|---|
+| tenant-alpha | 36 | 3,609 | 14,452 |
+| tenant-beta  | 36 | 3,730 | 14,351 |
+| tenant-gamma | 28 | 2,821 | 11,904 |
+
+**Prometheus snapshots — after fixes:**
+
+Queue wait P95 by tenant (dropped from 28–29s to 9.3–9.6s):
+
+![Queue wait P95 after fixes](docs/images/afterFix/after_queue_wait.jpg)
+
+```
+tenant-gamma: 9.589s   (was 28.885s — −67%)
+tenant-alpha: 9.325s   (was 28.188s — −67%)
+tenant-beta:  9.462s   (was 26.875s − −65%)
+```
+
+Failed tasks (zero — counter absent from Prometheus):
+
+![Failed tasks after fixes](docs/images/afterFix/after_failed_tasks.jpg)
+
+Task duration P95 by priority (no longer all pinned at 30s):
+
+![Task duration P95 after fixes](docs/images/afterFix/after_task_duration.jpg)
+
+```
+priority=urgent: 14.151s   (was 29.375s)
+priority=normal: 14.350s   (was 30.000s)
+priority=low:    17.417s   (was 28.731s)
+```
+
+Pipeline stage P95 — validate stage absent (removed by Fix 3):
+
+![Pipeline stage duration after fixes](docs/images/afterFix/after_pipeline_stages.jpg)
+
+```
+stage=plan:          6.583s
+stage=execute_tools: 0.494s   (was 0.945s — −48%, parallel execution)
+stage=summarise:     6.063s
+stage=validate:      (removed)
+```
+
+Tool latency P95 (unchanged — parallelization reduces stage time, not per-tool time):
+
+![Tool latency P95 after fixes](docs/images/afterFix/after_tool_latency.jpg)
+
+```
+search:          488.3ms
+database_lookup: 239.3ms
+calculator:       77.5ms
+```
+
+LLM retries (lower overall due to differentiated 429 backoff):
+
+![LLM retries after fixes](docs/images/afterFix/after_llm_retries.jpg)
+
+```
+reason=server_error: 25   (was 65 cumulative before — this run only)
+reason=rate_limit:   11   (was 38 cumulative before — this run only)
+```
+
+Token consumption by tenant:
+
+![LLM token usage after fixes](docs/images/afterFix/after_llm_tokens.jpg)
+
+```
+tenant-alpha: prompt=3,609   completion=14,452
+tenant-beta:  prompt=3,730   completion=14,351
+tenant-gamma: prompt=2,821   completion=11,904
 ```
 tenant-alpha: prompt=9,716   completion=30,599
 tenant-gamma: prompt=7,895   completion=24,521

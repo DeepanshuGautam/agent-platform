@@ -4,16 +4,13 @@ Coordinates the multi-step agent workflow:
   1. Plan — ask the LLM to create an execution plan
   2. Execute — run the required tools
   3. Summarise — ask the LLM to synthesise a final answer
-  4. Validate — quality-gate the LLM output
 """
 
 import time
 import logging
-import traceback
 from src.llm_client import call_llm
 from src.tool_executor import execute_tools
 from src.models import TaskResult, TaskStatus, Priority
-from src.config import LLM_SERVER_URL
 from src.telemetry import tracer, PIPELINE_STAGE_DURATION
 
 logger = logging.getLogger(__name__)
@@ -97,7 +94,7 @@ async def run_task(task_id: str, description: str,
                 stage_span.set_attribute("llm.completion_tokens", summary.get("completion_tokens", 0))
                 stage_span.set_attribute("llm.error", bool(summary.get("error")))
 
-            stage_status = "error" if (summary.get("error") and summary.get("text") is None) else "ok"
+            stage_status = "error" if summary.get("error") and not summary.get("text") else "ok"
             PIPELINE_STAGE_DURATION.labels(stage="summarise", status=stage_status).observe(time.time() - t0)
             total_prompt_tokens += summary.get("prompt_tokens", 0)
             total_completion_tokens += summary.get("completion_tokens", 0)
@@ -107,8 +104,7 @@ async def run_task(task_id: str, description: str,
                 "duration_seconds": round(time.time() - t0, 3),
             })
 
-            # Check if summary generation failed
-            if summary.get("error") and summary.get("text") is None:
+            if summary.get("error") and not summary.get("text"):
                 span.set_attribute("task.failed_stage", "summarise")
                 return TaskResult(
                     task_id=task_id, status=TaskStatus.FAILED,
@@ -118,32 +114,6 @@ async def run_task(task_id: str, description: str,
                                  "completion_tokens": total_completion_tokens},
                     created_at=created, completed_at=time.time(),
                 )
-
-            # ── Step 4: Quality validation ─────────────────────
-            # Enterprise quality gate: validate LLM output meets
-            # accuracy and compliance standards before returning to tenant
-            t0 = time.time()
-            with tracer.start_as_current_span("llm_validate") as stage_span:
-                validation = await call_llm(
-                    prompt=(
-                        f"Rate the quality of this response (1-10) and flag "
-                        f"any factual errors or compliance issues:\n\n"
-                        f"{summary.get('text', '')}"
-                    ),
-                    max_tokens=128,
-                )
-                stage_span.set_attribute("llm.prompt_tokens", validation.get("prompt_tokens", 0))
-                stage_span.set_attribute("llm.completion_tokens", validation.get("completion_tokens", 0))
-                stage_span.set_attribute("llm.quality_score", validation.get("text", "")[:100])
-
-            PIPELINE_STAGE_DURATION.labels(stage="validate", status="ok").observe(time.time() - t0)
-            total_prompt_tokens += validation.get("prompt_tokens", 0)
-            total_completion_tokens += validation.get("completion_tokens", 0)
-
-            logger.info("pipeline_stage_complete", extra={
-                "task_id": task_id, "stage": "validate",
-                "duration_seconds": round(time.time() - t0, 3),
-            })
 
             # Record execution details for audit trail
             _execution_log.append({
@@ -155,7 +125,6 @@ async def run_task(task_id: str, description: str,
                 "tool_results": tool_results,
                 "summary_prompt": summary_prompt,
                 "summary_response": summary,
-                "quality_score": validation.get("text", ""),
                 "token_usage": {"prompt": total_prompt_tokens,
                                 "completion": total_completion_tokens},
                 "completed_at": time.time(),
@@ -179,18 +148,12 @@ async def run_task(task_id: str, description: str,
             })
             span.record_exception(e)
             span.set_attribute("task.error", str(e))
-            # Provide detailed error context to help tenants
-            # debug integration issues faster
-            error_detail = (
-                f"Task execution failed: {str(e)}\n"
-                f"Trace: {traceback.format_exc()}\n"
-                f"Pipeline stage: {'plan' if total_prompt_tokens == 0 else 'execute'}\n"
-                f"LLM endpoint: {LLM_SERVER_URL}"
-            )
+            ctx = span.get_span_context()
+            trace_ref = format(ctx.trace_id, "032x") if ctx and ctx.is_valid else "unknown"
             return TaskResult(
                 task_id=task_id, status=TaskStatus.FAILED,
                 tenant_id=tenant_id, priority=priority,
-                error=error_detail,
+                error=f"Task execution failed. Reference trace_id={trace_ref} for details.",
                 token_usage={"prompt_tokens": total_prompt_tokens,
                              "completion_tokens": total_completion_tokens},
                 created_at=created, completed_at=time.time(),
