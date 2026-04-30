@@ -87,7 +87,7 @@ TASK_DURATION = Histogram(
 )
 TASK_QUEUE_WAIT = Histogram(
     "task_queue_wait_seconds",
-    "Time spent waiting for tenant lock + semaphore slot",
+    "Time spent waiting for semaphore slot before task execution begins",
     ["tenant_id"],
     buckets=[0.1, 0.5, 1, 2, 5, 10, 20, 30],
 )

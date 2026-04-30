@@ -35,10 +35,6 @@ _response_cache: dict[str, dict] = {}
 # Limit concurrent task executions to protect downstream LLM service
 _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
-# Ensure tasks for the same tenant execute in submission order
-# to prevent race conditions on downstream tenant state
-_tenant_locks: dict[str, asyncio.Lock] = {}
-
 
 class CreateTaskBody(BaseModel):
     task_description: str
@@ -99,26 +95,24 @@ async def create_task(body: CreateTaskBody):
     )
 
     async def _guarded_execute():
-        lock = _tenant_locks.setdefault(body.tenant_id, asyncio.Lock())
-        async with lock:
-            async with _task_semaphore:
-                queue_wait = time.time() - t_submitted
-                TASK_QUEUE_WAIT.labels(tenant_id=body.tenant_id).observe(queue_wait)
-                logger.info("task_executing", extra={
-                    "task_id": task_id,
-                    "tenant_id": body.tenant_id,
-                    "queue_wait_seconds": round(queue_wait, 3),
-                })
-                ACTIVE_TASKS.inc()
-                try:
-                    return await run_task(
-                        task_id=task_id,
-                        description=body.task_description,
-                        tenant_id=body.tenant_id,
-                        priority=body.priority,
-                    )
-                finally:
-                    ACTIVE_TASKS.dec()
+        async with _task_semaphore:
+            queue_wait = time.time() - t_submitted
+            TASK_QUEUE_WAIT.labels(tenant_id=body.tenant_id).observe(queue_wait)
+            logger.info("task_executing", extra={
+                "task_id": task_id,
+                "tenant_id": body.tenant_id,
+                "queue_wait_seconds": round(queue_wait, 3),
+            })
+            ACTIVE_TASKS.inc()
+            try:
+                return await run_task(
+                    task_id=task_id,
+                    description=body.task_description,
+                    tenant_id=body.tenant_id,
+                    priority=body.priority,
+                )
+            finally:
+                ACTIVE_TASKS.dec()
 
     # Enforce task-level deadline: clients should not wait indefinitely
     try:

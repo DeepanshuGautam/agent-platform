@@ -44,16 +44,7 @@ async def execute_tool(tool_name: str, args: dict) -> dict:
 
 
 async def execute_tools(tools: list[tuple[str, dict]]) -> list[dict]:
-    """Execute multiple tools and return results in order.
-
-    Args:
-        tools: List of (tool_name, args) tuples to execute.
-
-    Returns:
-        Ordered list of tool execution results.
-    """
-    results = []
-    for tool_name, args in tools:
-        result = await execute_tool(tool_name, args)
-        results.append(result)
-    return results
+    """Execute multiple tools concurrently and return results in order."""
+    return list(await asyncio.gather(
+        *[execute_tool(name, args) for name, args in tools]
+    ))

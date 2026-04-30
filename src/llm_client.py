@@ -166,11 +166,14 @@ async def call_llm(prompt: str, max_tokens: int = 512) -> dict:
                     "elapsed_seconds": round(elapsed, 3),
                 })
 
-            # Exponential backoff with jitter before next retry
+            # Differentiated backoff: 429 waits 2× longer than 500 to respect
+            # the rate-limit signal without blowing the 30s task budget
             if attempt < RETRY_MAX_ATTEMPTS - 1:
                 delay = RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** attempt)
-                jitter = random.uniform(0, delay * 0.3)
-                await asyncio.sleep(delay + jitter)
+                if last_status == 429:
+                    await asyncio.sleep(delay * 2 + random.uniform(0, 0.5))
+                else:
+                    await asyncio.sleep(delay + random.uniform(0, delay * 0.3))
 
         span.set_attribute("llm.status", "exhausted")
         span.set_attribute("llm.last_status_code", last_status or 0)
