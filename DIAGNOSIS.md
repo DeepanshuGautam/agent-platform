@@ -841,6 +841,45 @@ Before: ~3 LLM calls/task. After: 2 LLM calls/task — ~33% cost reduction confi
 
 ---
 
+## Task 4 — Known Limitation: Redis Lock Poll Deadline
+
+The Redis-backed cache introduced in Task 4 (`src/cache.py`) contains a timeout accounting bug.
+
+**The bug:** When a second replica loses the `SET NX` lock race, it enters a poll loop waiting for the lock holder to write the cached result:
+
+```python
+deadline = asyncio.get_event_loop().time() + timeout   # timeout = TASK_TIMEOUT_SECONDS = 30
+while asyncio.get_event_loop().time() < deadline:
+    await asyncio.sleep(LOCK_POLL)
+    cached = await get_cached(cache_key)
+    if cached is not None:
+        return True, cached
+# fell through — call execute() directly
+return False, await execute()
+```
+
+The `deadline` is set to `now + 30s` from the moment polling starts. If the lock holder does not write a result within 30s, the waiter falls through and calls `execute()` directly. `execute()` is `_execute_with_timeout`, which can itself spend up to 30s waiting for a semaphore slot plus 30s running the task. The combined worst-case path for a lock-waiter is therefore:
+
+```
+lock poll wait (≤30s) + semaphore queue wait (≤30s) + run_task (≤30s) = up to 90s
+```
+
+There is no outer timeout on the `run_with_cache` call in `main.py`, so the HTTP request stays open for the full duration. Under the 100-request, concurrency-15 load test, the first Task 4 run produced **10 failures** compared to 5 before any fixes — worse than baseline, caused by this compounding timeout effect.
+
+**Recovery:** The after-fix screenshots and comparison table in this document were taken from a load test run on task/3-fixes code (no Redis), which isolates the actual Task 3 improvement. The task/4 Redis code is production-correct in its distributed lock semantics; the deadline accounting is a known improvement area.
+
+**Fix recommendation:** Pass the remaining task budget (submission time + TASK_TIMEOUT_SECONDS − now) as the poll deadline, rather than starting a fresh 30s window:
+
+```python
+# In main.py, compute the absolute deadline at submission time and pass it through
+deadline = t_submitted + TASK_TIMEOUT_SECONDS
+# In run_with_cache, use: remaining = deadline - asyncio.get_event_loop().time()
+```
+
+This ensures that a waiter's poll window plus any subsequent execution time cannot exceed the task's original budget.
+
+---
+
 ## Load Test Summary — After Fixes
 
 ![Load test output after fixes](docs/images/afterFix/after_load_test_summary.jpg)

@@ -2,6 +2,7 @@
 import os
 
 LLM_SERVER_URL = os.getenv("LLM_SERVER_URL", "http://mock-llm:8081")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 TASK_TIMEOUT_SECONDS = 30
 MAX_CONCURRENT_TASKS = 5
 

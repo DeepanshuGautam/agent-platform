@@ -9,9 +9,11 @@ services:
     depends_on:
       - mock-llm
       - jaeger
+      - redis
     environment:
       - LLM_SERVER_URL=http://mock-llm:8081
       - OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+      - REDIS_URL=redis://redis:6379
 
   mock-llm:
     build: .
@@ -34,6 +36,11 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
 
   grafana:
     image: grafana/grafana:11.2.0
