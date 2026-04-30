@@ -68,21 +68,29 @@ Key metrics to query in Prometheus (http://localhost:9090):
 # Request rate by tenant and status
 rate(task_requests_total[1m])
 
-# P95 task latency
-histogram_quantile(0.95, rate(task_duration_seconds_bucket[5m]))
+# P95 task latency by priority
+histogram_quantile(0.95, sum by (priority, le) (rate(task_duration_seconds_bucket[10m])))
 
-# Queue wait time by tenant
-histogram_quantile(0.95, rate(task_queue_wait_seconds_bucket[5m]))
+# Queue wait P95 by tenant
+histogram_quantile(0.95, sum by (tenant_id, le) (rate(task_queue_wait_seconds_bucket[10m])))
 
-# LLM retry rate by reason
-rate(llm_retries_total[1m])
+# Pipeline stage P95 by stage
+histogram_quantile(0.95, sum by (stage, le) (rate(pipeline_stage_duration_seconds_bucket[10m])))
+
+# Tool latency P95 by tool
+histogram_quantile(0.95, sum by (tool, le) (rate(tool_execution_duration_seconds_bucket[10m])))
+
+# LLM retry count by reason
+llm_retries_total
 
 # Token consumption by tenant
-rate(llm_tokens_total[5m])
+llm_tokens_total
 
 # Cache hit rate
 rate(cache_hits_total[5m]) / rate(task_requests_total[5m])
 ```
+
+> **Note:** `histogram_quantile` requires the `le` label — always include it in `sum by`. Use a `[10m]` window immediately after the ~3-minute load test; a `[5m]` window will produce NaN once the data ages out.
 
 ### Logs
 Logs are emitted as structured JSON with `trace_id` and `span_id` on every line. To correlate a log entry to a Jaeger trace, copy the `trace_id` from a log line and paste it into the Jaeger trace search.
@@ -109,7 +117,7 @@ Auto-instrumentation packages (`opentelemetry-instrumentation-fastapi`) were dro
 | Layer | What's measured |
 |---|---|
 | `main.py` | End-to-end task duration, queue wait time, cache hits, active task count, token usage per tenant |
-| `orchestrator.py` | Per-stage duration (`plan`, `execute_tools`, `summarise`, `validate`), token counts per stage |
+| `orchestrator.py` | Per-stage duration (`plan`, `execute_tools`, `summarise`, `validate`), token counts per stage — `validate` stage present in this branch (before fixes) |
 | `llm_client.py` | Per-attempt latency, outcome (success / 429 / 500 / timeout), retry counts by reason |
 | `tool_executor.py` | Per-tool latency (`search`, `database_lookup`, `calculator`) |
 
@@ -130,7 +138,8 @@ All metrics are labeled by tenant, priority, and/or status to allow slicing by d
 | Codebase understanding | Asked Claude to explain each file and the request flow before touching anything |
 | Observability design | Discussed stack choice (OTel + Jaeger + Prometheus + Grafana) and span hierarchy before implementing |
 | Instrumentation | Claude generated all instrumentation code across `telemetry.py`, `main.py`, `orchestrator.py`, `llm_client.py`, `tool_executor.py` |
-| README | Claude drafted this document |
+| Diagnosis | Claude analyzed load test output and Prometheus metric values to identify and document each issue with evidence |
+| README | Claude drafted and updated this document |
 
 ### What worked well
 
@@ -145,3 +154,9 @@ All metrics are labeled by tenant, priority, and/or status to allow slicing by d
 ### AI accuracy
 
 No factually incorrect outputs were identified during instrumentation. All generated code was reviewed for correctness against the existing codebase structure before being accepted.
+
+---
+
+## Diagnosis Report
+
+See [DIAGNOSIS.md](DIAGNOSIS.md) — 8 issues identified and documented with real trace IDs, metric values, and screenshots from a live load test run (Completed=95, Failed=5, P50=15.98s, P95=30.01s).
